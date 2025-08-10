@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Timer émission radio avancé</title>
+<style>
+  body {
+    background:#121212; color:#eee; font-family: Arial, sans-serif;
+    max-width: 700px; margin: auto; padding: 20px;
+  }
+  h1 {
+    margin-bottom: 12px;
+  }
+  label {
+    font-weight: bold;
+  }
+  input[type="time"], input[type="text"], input[type="number"] {
+    font-size: 1em; padding: 5px; border-radius: 6px; border:none; background:#222; color:#eee;
+  }
+  button {
+    background:#0b84a5; color:#fff; border:none; padding:10px 18px; border-radius:6px;
+    font-size:1em; cursor:pointer; margin: 8px 6px 20px 0;
+    user-select:none;
+  }
+  button:disabled {
+    background:#444; cursor:not-allowed;
+  }
+  table {
+    width: 100%; border-collapse: collapse; margin-bottom: 20px;
+  }
+  th, td {
+    border: 1px solid #333;
+    padding: 8px 6px;
+    text-align: center;
+    font-size: 0.95em;
+  }
+  th {
+    background: #222;
+  }
+  input.segment-input {
+    width: 90%;
+    background: #222;
+    border: none;
+    color: #eee;
+    padding: 4px;
+    border-radius: 4px;
+  }
+  #segmentTimer {
+    font-size: 3em;
+    margin: 10px 0;
+    user-select:none;
+  }
+  #segmentTimer.over {
+    color: #f44336;
+    font-weight: bold;
+  }
+  #retardGlobal {
+    font-size: 1.5em;
+    margin-top: 12px;
+    user-select:none;
+  }
+  #retardGlobal.delay {
+    color: #f44336;
+    font-weight: bold;
+  }
+  #retardGlobal.early {
+    color: #4caf50;
+    font-weight: bold;
+  }
+  .flex-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .flex-row > * {
+    flex: none;
+  }
+</style>
+</head>
+<body>
+
+<h1>Timer émission radio</h1>
+
+<label for="startTime">Heure prévue de début :</label>
+<input type="time" id="startTime" value="14:00" step="60" />
+
+<h2>Segments</h2>
+<table id="segmentsTable" aria-label="Tableau des segments">
+  <thead>
+    <tr>
+      <th>Nom</th>
+      <th>Durée (min)</th>
+      <th>Heure de fin prévue</th>
+      <th>Supprimer</th>
+    </tr>
+  </thead>
+  <tbody></tbody>
+</table>
+
+<div class="flex-row">
+  <input type="text" id="newSegmentName" placeholder="Nom du segment" class="segment-input" />
+  <input type="number" id="newSegmentDuration" placeholder="Durée (min)" min="1" class="segment-input" style="width:100px" />
+  <button id="addSegmentBtn">Ajouter segment</button>
+</div>
+
+<div style="margin-top: 30px;">
+  <button id="startBtn">Début ▶</button>
+  <button id="pauseBtn" disabled>Pause ⏸</button>
+  <button id="nextBtn" disabled>Suivant ▶</button>
+  <button id="resetBtn" disabled>Arrêt ■</button>
+</div>
+
+<div style="margin-top:20px;">
+  <div><strong>Segment en cours :</strong> <span id="currentSegmentName">--</span></div>
+  <div id="segmentTimer">00:00</div>
+  <div><strong>Retard global :</strong> <span id="retardGlobal">0 s</span></div>
+</div>
+
+<script>
+(() => {
+  // Variables et état
+  let segments = [];
+  let currentSegmentIndex = -1;
+  let realStartTime = null; // Date réelle début émission
+  let segmentStartTime = null; // Date réelle début segment courant
+  let pauseStartTime = null; // Date début pause
+  let totalPausedTime = 0;   // ms cumulés pause depuis début émission
+  let retardAccumule = 0;    // cumul retard/avance segments passés en secondes
+  let timerInterval = null;
+  let isPaused = false;
+
+  // DOM
+  const startTimeInput = document.getElementById('startTime');
+  const segmentsTableBody = document.querySelector('#segmentsTable tbody');
+  const newSegmentName = document.getElementById('newSegmentName');
+  const newSegmentDuration = document.getElementById('newSegmentDuration');
+  const addSegmentBtn = document.getElementById('addSegmentBtn');
+
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const nextBtn = document.getElementById('nextBtn');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const currentSegmentNameEl = document.getElementById('currentSegmentName');
+  const segmentTimerEl = document.getElementById('segmentTimer');
+  const retardGlobalEl = document.getElementById('retardGlobal');
+
+  // Helpers
+  function pad(n){return n<10?'0'+n:n;}
+  function formatMS(s){
+    const m = Math.floor(Math.abs(s)/60);
+    const sec = Math.abs(s)%60;
+    return (s<0?'-':'')+pad(m)+':'+pad(sec);
+  }
+  function secondsToHMS(s) {
+    const h = Math.floor(Math.abs(s)/3600);
+    const m = Math.floor((Math.abs(s)%3600)/60);
+    const sec = Math.abs(s)%60;
+    return (s<0?'-':'') + (h>0 ? pad(h) + ':' : '') + pad(m) + ':' + pad(sec);
+  }
+
+  // Calcul date heure prévue début émission (aujourd’hui)
+  function getScheduledStartDate() {
+    const val = startTimeInput.value;
+    if (!val) return null;
+    const now = new Date();
+    const [h,m] = val.split(':').map(Number);
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0);
+  }
+
+  // Calcul heures de fin prévues segments (mise à jour tableau)
+  function updateSegmentEndTimes() {
+    const startDate = getScheduledStartDate();
+    if(!startDate) {
+      segmentsTableBody.querySelectorAll('tr').forEach((tr) => {
+        tr.querySelector('.endTime').textContent = '--:--';
+      });
+      return;
+    }
+    let cumSeconds = 0;
+    segments.forEach((seg, i) => {
+      cumSeconds += seg.duration*60;
+      const endDate = new Date(startDate.getTime() + cumSeconds*1000);
+      const h = endDate.getHours().toString().padStart(2,'0');
+      const min = endDate.getMinutes().toString().padStart(2,'0');
+      segmentsTableBody.querySelectorAll('tr')[i].querySelector('.endTime').textContent = h + ':' + min;
+    });
+  }
+
+  // Rafraichir tableau segments (input modifiable)
+  function renderSegmentsTable(){
+    segmentsTableBody.innerHTML = '';
+    segments.forEach((seg, i) => {
+      const tr = document.createElement('tr');
+
+      // Nom segment (input)
+      const tdName = document.createElement('td');
+      const inputName = document.createElement('input');
+      inputName.type = 'text';
+      inputName.value = seg.name;
+      inputName.className = 'segment-input';
+      inputName.addEventListener('change', () => {
+        segments[i].name = inputName.value.trim() || 'Sans nom';
+        renderSegmentsTable();
+      });
+      tdName.appendChild(inputName);
+      tr.appendChild(tdName);
+
+      // Durée segment (input minutes)
+      const tdDur = document.createElement('td');
+      const inputDur = document.createElement('input');
+      inputDur.type = 'number';
+      inputDur.min = 1;
+      inputDur.value = seg.duration;
+      inputDur.className = 'segment-input';
+      inputDur.style.width = '80px';
+      inputDur.addEventListener('change', () => {
+        let val = parseInt(inputDur.value, 10);
+        if(isNaN(val) || val<1) val = 1;
+        segments[i].duration = val;
+        inputDur.value = val;
+        updateSegmentEndTimes();
+      });
+      tdDur.appendChild(inputDur);
+      tr.appendChild(tdDur);
+
+      // Heure fin prévue (non modifiable)
+      const tdEnd = document.createElement('td');
+      tdEnd.className = 'endTime';
+      tdEnd.textContent = '--:--';
+      tr.appendChild(tdEnd);
+
+      // Bouton supprimer
+      const tdDel = document.createElement('td');
+      const btnDel = document.createElement('button');
+      btnDel.textContent = 'X';
+      btnDel.title = 'Supprimer segment';
+      btnDel.style.background = '#f44336';
+      btnDel.style.padding = '4px 8px';
+      btnDel.style.fontWeight = 'bold';
+      btnDel.style.cursor = 'pointer';
+      btnDel.style.borderRadius = '6px';
+      btnDel.addEventListener('click', () => {
+        if(confirm(`Supprimer le segment "${segments[i].name}" ?`)) {
+          segments.splice(i,1);
+          renderSegmentsTable();
+          updateSegmentEndTimes();
+        }
+      });
+      tdDel.appendChild(btnDel);
+      tr.appendChild(tdDel);
+
+      segmentsTableBody.appendChild(tr);
+    });
+    updateSegmentEndTimes();
+  }
+
+  // Ajouter segment depuis inputs
+  addSegmentBtn.addEventListener('click', () => {
+    const name = newSegmentName.value.trim() || 'Sans nom';
+    let dur = parseInt(newSegmentDuration.value,10);
+    if(isNaN(dur) || dur < 1) {
+      alert('Durée invalide, min 1 minute');
+      return;
+    }
+    segments.push({name, duration: dur});
+    newSegmentName.value = '';
+    newSegmentDuration.value = '';
+    renderSegmentsTable();
+  });
+
+  // Affichage du timer segment (décompte puis dépassement)
+  function updateSegmentTimer(){
+    if(!segmentStartTime) {
+      segmentTimerEl.textContent = '00:00';
+      segmentTimerEl.classList.remove('over');
+      return;
+    }
+    const now = new Date();
+    let elapsedSec = Math.floor((now - segmentStartTime - totalPausedTime)/1000);
+    const segDurSec = segments[currentSegmentIndex].duration * 60;
+
+    if(elapsedSec <= segDurSec) {
+      const remain = segDurSec - elapsedSec;
+      segmentTimerEl.textContent = formatMS(-remain);
+      segmentTimerEl.classList.remove('over');
+    } else {
+      const over = elapsedSec - segDurSec;
+      segmentTimerEl.textContent = '+' + formatMS(over);
+      segmentTimerEl.classList.add('over');
+    }
+  }
+
+  // Calcul retard global en temps réel (avant ET après début)
+  function updateRetardGlobal(){
+    const now = new Date();
+    const scheduledStart = getScheduledStartDate();
+    if(!scheduledStart) {
+      retardGlobalEl.textContent = '--:--';
+      retardGlobalEl.className = '';
+      return;
+    }
+
+    if(!realStartTime) {
+      // Avant début : retard = temps réel - heure prévue début
+      let diffSec = Math.floor((now - scheduledStart)/1000);
+      retardGlobalEl.textContent = (diffSec>=0?'+':'') + formatMS(diffSec);
+      retardGlobalEl.className = diffSec > 0 ? 'delay' : (diffSec < 0 ? 'early' : '');
+      return;
+    }
+
+    // Après début, calcul retard global =  
+    // retardAccumule + (temps écoulé segment courant - durée segment courant)
+    const elapsedRealMs = now - segmentStartTime - totalPausedTime;
+    const elapsedSegSec = Math.floor(elapsedRealMs/1000);
+    const segDurSec = segments[currentSegmentIndex].duration * 60;
+    const retardSegmentActuel = elapsedSegSec - segDurSec;
+
+    const retardTotal = retardAccumule + retardSegmentActuel;
+
+    retardGlobalEl.textContent = (retardTotal >= 0 ? '+' : '') + secondsToHMS(retardTotal);
+
+    if(retardTotal > 0) {
+      retardGlobalEl.className = 'delay';
+    } else if(retardTotal < 0) {
+      retardGlobalEl.className = 'early';
+    } else {
+      retardGlobalEl.className = '';
+    }
+  }
+
+  // Démarrer timers (après clic Début)
+  function startTimers(){
+    if(timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+      if(!isPaused){
+        updateSegmentTimer();
+        updateRetardGlobal();
+      }
+    }, 500);
+  }
+
+  // Bouton Pause toggle
+  pauseBtn.addEventListener('click', () => {
+    if(!realStartTime) return;
+    if(!isPaused){
+      isPaused = true;
+      pauseStartTime = new Date();
+      pauseBtn.textContent = 'Reprendre ▶';
+    } else {
+      isPaused = false;
+      const pauseEnd = new Date();
+      totalPausedTime += (pauseEnd - pauseStartTime);
+      pauseStartTime = null;
+      pauseBtn.textContent = 'Pause ⏸';
+    }
+  });
+
+  // Bouton Début
+  startBtn.addEventListener('click', () => {
+    if(segments.length === 0){
+      alert('Ajoute au moins un segment avant de commencer');
+      return;
+    }
+    if(realStartTime) return;
+
+    realStartTime = new Date();
+    segmentStartTime = realStartTime;
+    currentSegmentIndex = 0;
+    retardAccumule = Math.floor((realStartTime - getScheduledStartDate())/1000);
+    totalPausedTime = 0;
+    isPaused = false;
+    pauseStartTime = null;
+
+    currentSegmentNameEl.textContent = segments[currentSegmentIndex].name;
+    startBtn.disabled = true;
+    pauseBtn.disabled = false;
+    nextBtn.disabled = false;
+    resetBtn.disabled = false;
+
+    // Verrouille inputs
+    Array.from(segmentsTableBody.querySelectorAll('input')).forEach(inp => inp.disabled = true);
+    startTimeInput.disabled = true;
+    addSegmentBtn.disabled = true;
+
+    updateSegmentTimer();
+    updateRetardGlobal();
+    startTimers();
+  });
+
+  // Bouton Suivant
+  nextBtn.addEventListener('click', () => {
+    if(currentSegmentIndex < 0) return;
+    if(isPaused) {
+      alert('Reprends la lecture avant de passer au suivant');
+      return;
+    }
+
+    const now = new Date();
+    const elapsedSegmentSec = Math.floor((now - segmentStartTime - totalPausedTime)/1000);
+    const segmentDurationSec = segments[currentSegmentIndex].duration * 60;
+
+    // Calcul retard segment : positif si en retard, négatif si en avance
+    const retardSegment = elapsedSegmentSec - segmentDurationSec;
+
+    // Met à jour cumul retard global
+    retardAccumule += retardSegment;
+
+    currentSegmentIndex++;
+    if(currentSegmentIndex >= segments.length){
+      currentSegmentNameEl.textContent = "Émission terminée";
+      segmentTimerEl.textContent = "00:00";
+      const r = retardAccumule;
+      retardGlobalEl.textContent = (r>=0?'+':'') + secondsToHMS(r);
+      retardGlobalEl.className = r > 0 ? 'delay' : (r < 0 ? 'early' : '');
+      nextBtn.disabled = true;
+      pauseBtn.disabled = true;
+      stopTimers();
+      return;
+    }
+
+    segmentStartTime = now;
+    totalPausedTime = 0;
+
+    currentSegmentNameEl.textContent = segments[currentSegmentIndex].name;
+    updateSegmentTimer();
+    updateRetardGlobal();
+  });
+
+  // Arrêt & reset
+  resetBtn.addEventListener('click', () => {
+    stopTimers();
+    realStartTime = null;
+    segmentStartTime = null;
+    pauseStartTime = null;
+    totalPausedTime = 0;
+    retardAccumule = 0;
+    currentSegmentIndex = -1;
+    isPaused = false;
+
+    currentSegmentNameEl.textContent = '--';
+    segmentTimerEl.textContent = '00:00';
+    segmentTimerEl.classList.remove('over');
+    retardGlobalEl.textContent = '0 s';
+    retardGlobalEl.className = '';
+
+    startBtn.disabled = false;
+    pauseBtn.disabled = true;
+    nextBtn.disabled = true;
+    resetBtn.disabled = true;
+
+    // Déverrouille inputs
+    Array.from(segmentsTableBody.querySelectorAll('input')).forEach(inp => inp.disabled = false);
+    startTimeInput.disabled = false;
+    addSegmentBtn.disabled = false;
+  });
+
+  function stopTimers(){
+    if(timerInterval){
+      clearInterval(timerInterval);
+      timerInterval = null;
+    }
+  }
+
+  // Met à jour heures fin segments au changement heure début
+  startTimeInput.addEventListener('change', updateSegmentEndTimes);
+
+  // Initialisation segments exemples
+  segments = [
+    {name:'Intro', duration: 5},
+    {name:'Interview', duration: 20},
+    {name:'Pause', duration: 10},
+  ];
+  renderSegmentsTable();
+
+  // Mise à jour retard global en continu même avant début
+  setInterval(() => {
+    if(!isPaused){
+      updateRetardGlobal();
+      if(realStartTime === null){
+        // On peut afficher le segment timer à 00:00 en attendant
+        segmentTimerEl.textContent = '00:00';
+        segmentTimerEl.classList.remove('over');
+        currentSegmentNameEl.textContent = '--';
+      }
+    }
+  }, 500);
+
+})();
+</script>
+
+</body>
+</html>
